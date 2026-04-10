@@ -1,0 +1,31 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres:5432/fhir
+    username: fhir
+    password: fhirpass
+    driverClassName: org.postgresql.Driver
+  jpa:
+    properties:
+      hibernate.dialect: ca.uhn.fhir.jpa.model.dialect.HapiFhirPostgresDialect
+      hibernate.search.enabled: false
+      hibernate.format_sql: false
+      hibernate.show_sql: false
+  flyway:
+    enabled: false
+
+hapi:
+  fhir:
+    fhir_version: R4
+    server_address: http://localhost:8080/fhir
+    allow_multiple_delete: true
+    allow_cascading_deletes: true
+    allow_external_references: true
+    enforce_referential_integrity_on_write: true
+    enforce_referential_integrity_on_delete: false
+    default_encoding: JSON
+    default_pretty_print: true
+    validation:
+      requests_enabled: false
+      responses_enabled: false
+    bulk_export_enabled: true
+    narrative_enabled: false

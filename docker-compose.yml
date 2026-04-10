@@ -1,0 +1,145 @@
+name: fhir-pipeline
+
+services:
+
+  postgres:
+    image: postgres:15
+    container_name: fhir_postgres
+    environment:
+      POSTGRES_USER: fhir
+      POSTGRES_PASSWORD: fhirpass
+      POSTGRES_DB: fhir
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init-airflow.sql:/docker-entrypoint-initdb.d/init-airflow.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fhir -d fhir"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  hapi-fhir:
+    image: hapiproject/hapi:latest
+    container_name: hapi_fhir
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      spring.datasource.url: jdbc:postgresql://postgres:5432/fhir
+      spring.datasource.username: fhir
+      spring.datasource.password: fhirpass
+      spring.jpa.properties.hibernate.dialect: org.hibernate.dialect.PostgreSQLDialect
+      hapi.fhir.allow_cascading_deletes: "true"
+    volumes:
+      - ./hapi/application.yaml:/app/config/application.yaml:ro
+    ports:
+      - "8080:8080"
+  hapi-ready:
+    image: curlimages/curl:8.10.1
+    container_name: fhir_hapi_ready
+    depends_on:
+      - hapi-fhir
+    command:
+      [
+        "curl","--fail","--silent","--show-error",
+        "--retry","90","--retry-delay","2","--retry-connrefused",
+        "http://hapi-fhir:8080/fhir/metadata"
+      ]
+    restart: "no"
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: fhir_kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: "/tmp/kraft-logs"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka_ui
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "9091:8080"
+    restart: unless-stopped
+
+  airflow:
+    image: apache/airflow:2.10.0-python3.12
+    container_name: airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://fhir:fhirpass@postgres:5432/fhir
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8081:8080"
+    command: >
+      bash -c "
+      airflow db init &&
+      airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin || true;
+      airflow webserver &
+      airflow scheduler
+      "
+
+  etl-producer:
+    build: ./etl
+    container_name: fhir_producer
+    environment:
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: fhir-patients
+      CSV_PATH: /opt/app/data/patients.csv
+      CSV_ENCODING: ISO-8859-1
+    volumes:
+      - ./data:/opt/app/data
+    depends_on:
+      hapi-ready:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    command: ["python", "/opt/app/kafka_producer.py"]
+
+  etl-consumer:
+    build: ./etl
+    container_name: fhir_consumer
+    environment:
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: fhir-patients
+      FHIR_BASE: http://hapi-fhir:8080/fhir
+      CONSUMER_TIMEOUT_MS: "15000"
+    depends_on:
+      etl-producer:
+        condition: service_completed_successfully
+    restart: "no"
+    command: ["python", "/opt/app/kafka_consumer.py"]
+
+volumes:
+  pgdata:
+  kafka_data:
