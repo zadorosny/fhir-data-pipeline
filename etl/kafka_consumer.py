@@ -29,6 +29,7 @@ from etl.lib.fhir import (
 )
 from etl.lib.logging_setup import configure_logging
 from etl.lib.metrics import dlq_total, messages_total, post_latency, start_metrics_server
+from etl.lib.redaction import hash_cpf
 from etl.lib.transform import split_observations
 
 
@@ -49,7 +50,7 @@ def process_patient(
             "Falha definitiva ao criar Patient",
             extra={
                 "event": "patient_failed",
-                "cpf": data.get("cpf"),
+                "cpf_hash": hash_cpf(data.get("cpf")),
                 "status": exc.status_code,
                 "body": exc.body,
             },
@@ -65,7 +66,7 @@ def process_patient(
         "Patient processado",
         extra={
             "event": "patient_ok",
-            "cpf": data.get("cpf"),
+            "cpf_hash": hash_cpf(data.get("cpf")),
             "status": status,
             "id": body.get("id"),
         },
