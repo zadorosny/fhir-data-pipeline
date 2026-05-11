@@ -6,8 +6,15 @@ Todas as constantes sensiveis (broker, URLs, retries) ficam aqui.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Encodings comuns para CSVs do SUS/IBGE/Datasus. Mantemos uma allowlist
+# explicita para travar erros de configuracao no startup e prevenir
+# manipulacao maliciosa via env var.
+CsvEncoding = Literal["ISO-8859-1", "UTF-8", "UTF-8-SIG", "Windows-1252"]
 
 
 class ETLSettings(BaseSettings):
@@ -20,7 +27,7 @@ class ETLSettings(BaseSettings):
     fhir_base: str = Field(default="http://hapi-fhir:8080/fhir", alias="HAPI_BASE_URL")
 
     csv_path: str = Field(default="/opt/app/data/patients.csv")
-    csv_encoding: str = Field(default="ISO-8859-1")
+    csv_encoding: CsvEncoding = Field(default="ISO-8859-1")
 
     consumer_timeout_ms: int = Field(default=15000, ge=1000)
     hapi_retry_attempts: int = Field(default=30, ge=1, le=300)
