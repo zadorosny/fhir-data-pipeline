@@ -6,8 +6,9 @@ Funcoes aqui sao 100 por cento testaveis sem Spark/Kafka/HAPI.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import datetime
-from typing import Any, Iterable
+from typing import Any
 
 CANONICAL_COLUMNS = {
     "Nome": ("Nome",),
@@ -67,9 +68,7 @@ def _loose_match(expected: str, actual: str) -> bool:
 def _strip_accents(s: str) -> str:
     import unicodedata
 
-    return "".join(
-        c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c)
-    )
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
 
 def parse_date(date_str: str | None) -> str:

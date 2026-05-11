@@ -17,8 +17,8 @@ from kafka import KafkaConsumer
 from etl.lib.config import get_settings
 from etl.lib.dlq import make_dlq_producer, publish_to_dlq
 from etl.lib.fhir import (
-    FHIRError,
     OBSERVATION_MAP,
+    FHIRError,
     build_condition_resource,
     build_patient_resource,
     build_session,
@@ -43,9 +43,7 @@ def process_patient(
     criteria = patient_search_criteria(data.get("cpf", ""))
     start = time.perf_counter()
     try:
-        body, created = post_resource(
-            session, base_url, patient, if_none_exist=criteria
-        )
+        body, created = post_resource(session, base_url, patient, if_none_exist=criteria)
     except FHIRError as exc:
         logger.error(
             "Falha definitiva ao criar Patient",
@@ -98,9 +96,7 @@ def process_conditions(
         criteria = condition_search_criteria(patient_ref, info["snomed_code"])
         start = time.perf_counter()
         try:
-            _, created = post_resource(
-                session, base_url, cond, if_none_exist=criteria
-            )
+            _, created = post_resource(session, base_url, cond, if_none_exist=criteria)
             status = "created" if created else "exists"
             messages_total.labels(resource="Condition", status=status).inc()
         except FHIRError as exc:

@@ -15,10 +15,10 @@ from etl.lib.transform import (
     split_observations,
 )
 
-
 # ---------------------------------------------------------------------------
 # parse_date
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     ("entrada", "esperado"),
@@ -43,6 +43,7 @@ def test_parse_date_invalido_usa_fallback(entrada: str | None) -> None:
 # clean_cpf
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     ("entrada", "esperado"),
     [
@@ -60,6 +61,7 @@ def test_clean_cpf(entrada: str | None, esperado: str) -> None:
 # ---------------------------------------------------------------------------
 # map_gender
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     ("entrada", "esperado"),
@@ -84,6 +86,7 @@ def test_map_gender(entrada: str | None, esperado: str) -> None:
 # split_observations
 # ---------------------------------------------------------------------------
 
+
 def test_split_observations_simples() -> None:
     assert split_observations("Gestante") == ["Gestante"]
 
@@ -103,6 +106,7 @@ def test_split_observations_none() -> None:
 # ---------------------------------------------------------------------------
 # build_column_map
 # ---------------------------------------------------------------------------
+
 
 def test_build_column_map_acentos_e_bom() -> None:
     cols = [
@@ -147,6 +151,7 @@ def test_build_column_map_coluna_faltando() -> None:
 # row_to_message
 # ---------------------------------------------------------------------------
 
+
 def test_row_to_message_completo() -> None:
     row = {
         "Nome": "  João da Silva ",
@@ -179,6 +184,7 @@ def test_row_to_message_campos_nulos() -> None:
 # ---------------------------------------------------------------------------
 # split_name (re-export via fhir)
 # ---------------------------------------------------------------------------
+
 
 def test_split_name_dois_termos() -> None:
     given, family = split_name("João Silva")

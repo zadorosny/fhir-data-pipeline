@@ -36,8 +36,10 @@ def test_override_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_metrics_port_fora_da_faixa(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydantic import ValidationError
+
     monkeypatch.setenv("METRICS_PORT", "80")
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         ETLSettings()
 
 

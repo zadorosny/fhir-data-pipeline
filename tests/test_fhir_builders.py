@@ -16,7 +16,6 @@ from etl.lib.fhir import (
     patient_search_criteria,
 )
 
-
 PATIENT_DATA = {
     "nome": "Maria Souza",
     "cpf": "987.654.321-01",
@@ -58,9 +57,7 @@ def test_build_patient_gender_e_birthdate() -> None:
 
 def test_build_patient_telecom_quando_telefone_presente() -> None:
     p = build_patient_resource(PATIENT_DATA)
-    assert p["telecom"] == [
-        {"system": "phone", "value": "(21) 9876-5432", "use": "mobile"}
-    ]
+    assert p["telecom"] == [{"system": "phone", "value": "(21) 9876-5432", "use": "mobile"}]
 
 
 def test_build_patient_sem_telefone_nao_inclui_telecom() -> None:
@@ -90,6 +87,7 @@ def test_patient_search_criteria() -> None:
 # ---------------------------------------------------------------------------
 # Condition
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("obs_key", list(OBSERVATION_MAP.keys()))
 def test_build_condition_resource_para_cada_observacao_conhecida(obs_key: str) -> None:

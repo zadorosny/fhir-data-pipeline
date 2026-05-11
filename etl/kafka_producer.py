@@ -65,25 +65,17 @@ def main() -> int:
         },
     )
 
-    spark = (
-        SparkSession.builder.appName("FHIR-Kafka-Producer")
-        .master("local[*]")
-        .getOrCreate()
-    )
+    spark = SparkSession.builder.appName("FHIR-Kafka-Producer").master("local[*]").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
 
     try:
         rows = read_csv(spark, settings.csv_path, settings.csv_encoding)
     except ColumnMappingError as exc:
-        logger.error(
-            "CSV invalido", extra={"event": "csv_invalid", "error": str(exc)}
-        )
+        logger.error("CSV invalido", extra={"event": "csv_invalid", "error": str(exc)})
         spark.stop()
         return 2
 
-    logger.info(
-        "CSV carregado", extra={"event": "csv_loaded", "rows": len(rows)}
-    )
+    logger.info("CSV carregado", extra={"event": "csv_loaded", "rows": len(rows)})
 
     producer = make_producer(settings.kafka_broker)
     sent = 0

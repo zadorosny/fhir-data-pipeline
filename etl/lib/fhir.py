@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 # Builders puros
 # ---------------------------------------------------------------------------
 
+
 def split_name(nome: str) -> tuple[list[str], str]:
     """Divide nome em (given, family). Ultima palavra vira family."""
     parts = [p for p in nome.strip().split() if p]
@@ -76,9 +77,7 @@ def build_patient_resource(data: dict[str, Any]) -> dict[str, Any]:
     resource: dict[str, Any] = {
         "resourceType": "Patient",
         "meta": {"profile": [BR_INDIVIDUO_PROFILE]},
-        "identifier": [
-            {"use": "official", "system": CPF_SYSTEM, "value": cpf}
-        ],
+        "identifier": [{"use": "official", "system": CPF_SYSTEM, "value": cpf}],
         "active": True,
         "name": [{"use": "official", "family": family, "given": given}],
         "gender": map_gender(data.get("genero")),
@@ -87,15 +86,11 @@ def build_patient_resource(data: dict[str, Any]) -> dict[str, Any]:
 
     telefone = (data.get("telefone") or "").strip()
     if telefone:
-        resource["telecom"] = [
-            {"system": "phone", "value": telefone, "use": "mobile"}
-        ]
+        resource["telecom"] = [{"system": "phone", "value": telefone, "use": "mobile"}]
 
     pais = (data.get("pais") or "").strip()
     if pais:
-        resource["extension"] = [
-            {"url": PATIENT_BIRTHPLACE_EXT, "valueAddress": {"country": pais}}
-        ]
+        resource["extension"] = [{"url": PATIENT_BIRTHPLACE_EXT, "valueAddress": {"country": pais}}]
     return resource
 
 
@@ -166,6 +161,7 @@ def condition_search_criteria(patient_ref: str, snomed_code: str) -> str:
 # ---------------------------------------------------------------------------
 # HTTP client
 # ---------------------------------------------------------------------------
+
 
 class FHIRError(RuntimeError):
     """Erro definitivo apos esgotar retries."""

@@ -30,5 +30,4 @@ def configure_logging(level: str = "INFO", *, service: str = "fhir-etl") -> logg
     handler.setFormatter(fmt)
     root.addHandler(handler)
 
-    logger = logging.getLogger(service)
-    return logger
+    return logging.getLogger(service)
