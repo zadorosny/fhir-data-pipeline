@@ -23,7 +23,9 @@ def configure_logging(level: str = "INFO", *, service: str = "fhir-etl") -> logg
         root.removeHandler(h)
 
     handler = logging.StreamHandler(sys.stdout)
-    fmt = jsonlogger.JsonFormatter(
+    # python-json-logger nao publica py.typed/stubs - mypy strict trata
+    # JsonFormatter como Any e dispara `no-untyped-call`.
+    fmt = jsonlogger.JsonFormatter(  # type: ignore[no-untyped-call]
         "%(asctime)s %(levelname)s %(name)s %(message)s",
         rename_fields={"asctime": "ts", "levelname": "level", "name": "logger"},
     )
