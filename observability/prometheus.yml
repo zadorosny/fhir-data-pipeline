@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    project: fhir-data-pipeline
+
+scrape_configs:
+  - job_name: fhir-consumer
+    static_configs:
+      - targets:
+          - etl-consumer:8001
+        labels:
+          service: fhir-consumer
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
