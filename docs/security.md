@@ -41,9 +41,14 @@ O `hapi-fhir` no compose escuta HTTP simples em `8080`. Para produção:
 
 ## Logs e PHI
 
-O consumer registra `cpf` em alguns logs (campo `extra.cpf`). Em prod, considere:
-- mascarar no agregador (Loki promtail pipeline; CloudWatch metric filter).
-- ou trocar para `cpf_hash = sha256(cpf)` no `etl/lib/fhir.py` e propagar.
+O consumer **nunca** emite CPF em texto claro. Os call sites em `etl/kafka_consumer.py:process_patient` aplicam `hash_cpf` de `etl/lib/redaction.py` no campo `extra.cpf_hash` (SHA-256 prefixado por `sha256:`).
+
+Regras:
+- Pesquisa por `"cpf"` (sem `_hash`) em log aggregator deve retornar **zero** hits — qualquer match é sinal de regressão.
+- Para depuração local com humanos, use `mask_cpf` (`***.***.***-NN`) — preserva últimos 2 dígitos para correlação manual sem expor o identificador.
+- Testes de regressão em `tests/test_consumer_logging.py` falham se alguém reintroduzir `"cpf": data.get("cpf")` nos `extra={...}`.
+
+Em downstream (Loki/CloudWatch), aplique também redação de cabeçalhos HTTP (`Authorization`, `X-Forwarded-For`) e payloads de erro do HAPI antes da retenção longa.
 
 ## Dependências e CVEs
 
@@ -60,10 +65,37 @@ Periodicidade sugerida (ambiente sensível):
 |--------------------------------------|-------------|-----------------------------------------------|
 | `POSTGRES_PASSWORD`                  | 90d         | `ALTER USER fhir WITH PASSWORD '...'`; restart HAPI |
 | `AIRFLOW_DB_PASSWORD`                | 90d         | `ALTER USER airflow_user WITH PASSWORD '...'`; restart Airflow |
-| `AIRFLOW__CORE__FERNET_KEY`          | 365d        | Re-encrypt connections (ver `docs/deployment.md`) |
+| `AIRFLOW__CORE__FERNET_KEY`          | 365d / on-exposure | Ver runbook abaixo                       |
 | `AIRFLOW__WEBSERVER__SECRET_KEY`     | 90d         | Invalida sessões ativas — coordene com usuários |
 | `AIRFLOW_ADMIN_PASSWORD`             | 90d / on-leave | `airflow users reset-password`              |
 | `GRAFANA_ADMIN_PASSWORD`             | 90d         | Edite `.env` e reinicie o container Grafana   |
+
+### Runbook: rotação do Fernet key
+
+O Fernet key cifra as connections e variables sensíveis no metadata DB do Airflow. **Sempre rotacionar quando**:
+- a chave foi compartilhada com terceiros (inclusive logs de assistentes de IA, screenshots de `.env`, paste em chat);
+- desligamento de membro com acesso ao `.env`;
+- vencimento da cadência de 365d.
+
+Como `.env` está gitignored, **não há remediação necessária no histórico git** — basta gerar e ativar uma nova chave:
+
+```bash
+# 1. Gere a nova chave
+NEW_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+
+# 2. Adicione ao .env como segunda chave (sintaxe key1,key2 = re-encrypt aceito)
+sed -i "s|^AIRFLOW__CORE__FERNET_KEY=.*|AIRFLOW__CORE__FERNET_KEY=${NEW_KEY},$(grep ^AIRFLOW__CORE__FERNET_KEY .env | cut -d= -f2)|" .env
+
+# 3. Restart Airflow e re-encripte connections com a nova chave
+docker compose up -d airflow
+docker compose exec airflow airflow rotate-fernet-key
+
+# 4. Remova a chave antiga do .env (mantenha somente a nova)
+sed -i "s|^AIRFLOW__CORE__FERNET_KEY=${NEW_KEY},.*|AIRFLOW__CORE__FERNET_KEY=${NEW_KEY}|" .env
+docker compose up -d airflow
+```
+
+Se houver suspeita de exfiltração do metadata DB junto com a chave antiga, tratar todas as connections/variables como comprometidas e rotacionar cada credencial referenciada nelas.
 
 ## Reportando vulnerabilidades
 
