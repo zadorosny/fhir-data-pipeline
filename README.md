@@ -29,7 +29,7 @@ Pipeline ETL com Kafka + PySpark que carrega pacientes (CSV) em um servidor HAPI
 | PostgreSQL     | `postgres:15`                       | 5432          | HAPI (schema `public`) + Airflow (schema `airflow`, role dedicada) |
 | HAPI FHIR      | `hapiproject/hapi:latest`           | 8080          | Servidor FHIR R4                         |
 | Kafka (KRaft)  | `apache/kafka:3.8.0`                | 9092          | Tópicos: `fhir-patients` + `fhir-patients-dlq` |
-| Kafka UI       | `provectuslabs/kafka-ui`            | 9091          | Inspeção visual de tópicos               |
+| Kafka UI**     | `provectuslabs/kafka-ui`            | 9091          | Inspeção visual de tópicos (opcional)    |
 | Airflow        | `apache/airflow:2.10.0-python3.12`  | 8081          | DAG `fhir_patient_etl`                   |
 | Producer       | build local (`etl/`)                | —             | PySpark CSV → Kafka                      |
 | Consumer       | build local (`etl/`)                | 8001 metrics  | Kafka → HAPI com retries + DLQ           |
@@ -37,6 +37,7 @@ Pipeline ETL com Kafka + PySpark que carrega pacientes (CSV) em um servidor HAPI
 | Grafana*       | `grafana/grafana`                   | 3000          | Dashboard provisionado (opcional)        |
 
 `*` requer `--profile monitoring` + `docker-compose.observability.yml`.
+`**` requer `--profile debug` — UI administrativa do Kafka sem autenticação, fora por default.
 
 ## Quickstart
 
