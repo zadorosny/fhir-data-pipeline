@@ -100,9 +100,12 @@ services:
     logging: *default-logging
     restart: unless-stopped
 
+  # UI administrativa do Kafka. Sem autenticacao - opt-in via:
+  #   docker compose --profile debug up -d
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka_ui
+    profiles: ["debug"]
     depends_on:
       - kafka
     environment:

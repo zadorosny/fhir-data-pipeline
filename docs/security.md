@@ -9,7 +9,8 @@
 | Token Fernet          | Cifragem fraca de connections          | Geração aleatória obrigatória; rotação documentada |
 | Docker socket no host | Container Airflow vira root no host    | **Risco aceito** em dev; em prod use `KubernetesPodOperator` (ver abaixo) |
 | Dados clínicos (CPF)  | Exfiltração via FHIR REST exposto       | Em prod, HAPI atrás de reverse proxy com auth e TLS |
-| Logs de aplicação     | CPF/PHI em texto claro                  | Logs estruturados JSON; redação no agregador antes da retenção longa |
+| Logs de aplicação     | CPF/PHI em texto claro                  | `hash_cpf` (SHA-256) aplicado nos logs do consumer (`etl/lib/redaction.py`) — pesquisa por "cpf" em log aggregator = sinal de regressão |
+| Kafka UI sem auth     | Operador hostil enumera/dropa tópicos   | Fora por default; opt-in via `docker compose --profile debug up` |
 
 ## Princípio de menor privilégio (Postgres)
 
