@@ -1,21 +1,29 @@
 name: fhir-pipeline
 
+# Variaveis carregadas de .env (use .env.example como template).
+# Nenhuma credencial deve viver hardcoded neste arquivo.
+
+x-postgres-creds: &postgres-creds
+  POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER nao definido em .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD nao definido em .env}
+  POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB nao definido em .env}
+
 services:
 
   postgres:
     image: postgres:15
     container_name: fhir_postgres
     environment:
-      POSTGRES_USER: fhir
-      POSTGRES_PASSWORD: fhirpass
-      POSTGRES_DB: fhir
+      <<: *postgres-creds
+      AIRFLOW_DB_USER: ${AIRFLOW_DB_USER:?AIRFLOW_DB_USER nao definido em .env}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?AIRFLOW_DB_PASSWORD nao definido em .env}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./postgres/init-airflow.sql:/docker-entrypoint-initdb.d/init-airflow.sql
+      - ./postgres/init-db.sh:/docker-entrypoint-initdb.d/10-init-db.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fhir -d fhir"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -27,15 +35,16 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      spring.datasource.url: jdbc:postgresql://postgres:5432/fhir
-      spring.datasource.username: fhir
-      spring.datasource.password: fhirpass
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
       spring.jpa.properties.hibernate.dialect: org.hibernate.dialect.PostgreSQLDialect
       hapi.fhir.allow_cascading_deletes: "true"
     volumes:
       - ./hapi/application.yaml:/app/config/application.yaml:ro
     ports:
-      - "8080:8080"
+      - "${HAPI_PORT:-8080}:8080"
+
   hapi-ready:
     image: curlimages/curl:8.10.1
     container_name: fhir_hapi_ready
@@ -61,8 +70,9 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_LOG_DIRS: "/tmp/kraft-logs"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     ports:
-      - "9092:9092"
+      - "${KAFKA_PORT:-9092}:9092"
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
@@ -81,7 +91,7 @@ services:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
     ports:
-      - "9091:8080"
+      - "${KAFKA_UI_PORT:-9091}:8080"
     restart: unless-stopped
 
   airflow:
@@ -92,30 +102,45 @@ services:
         condition: service_healthy
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://fhir:fhirpass@postgres:5432/fhir
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:?AIRFLOW__CORE__FERNET_KEY nao definido em .env}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:?AIRFLOW__WEBSERVER__SECRET_KEY nao definido em .env}
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "False"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:?AIRFLOW_ADMIN_USER nao definido em .env}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?AIRFLOW_ADMIN_PASSWORD nao definido em .env}
+      AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@example.com}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
-      - "8081:8080"
-    command: >
-      bash -c "
-      airflow db init &&
-      airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin || true;
-      airflow webserver &
-      airflow scheduler
-      "
+      - "${AIRFLOW_PORT:-8081}:8080"
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db init
+        airflow users create \
+          --username "$${AIRFLOW_ADMIN_USER}" \
+          --firstname Admin --lastname User --role Admin \
+          --email "$${AIRFLOW_ADMIN_EMAIL}" \
+          --password "$${AIRFLOW_ADMIN_PASSWORD}" || true
+        airflow webserver &
+        exec airflow scheduler
 
   etl-producer:
     build: ./etl
     container_name: fhir_producer
     environment:
-      KAFKA_BROKER: kafka:9092
-      KAFKA_TOPIC: fhir-patients
-      CSV_PATH: /opt/app/data/patients.csv
-      CSV_ENCODING: ISO-8859-1
+      KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-fhir-patients}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-fhir-patients-dlq}
+      CSV_PATH: ${CSV_PATH:-/opt/app/data/patients.csv}
+      CSV_ENCODING: ${CSV_ENCODING:-ISO-8859-1}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./data:/opt/app/data
     depends_on:
@@ -124,21 +149,28 @@ services:
       kafka:
         condition: service_healthy
     restart: "no"
-    command: ["python", "/opt/app/kafka_producer.py"]
+    command: ["python", "-m", "etl.kafka_producer"]
 
   etl-consumer:
     build: ./etl
     container_name: fhir_consumer
     environment:
-      KAFKA_BROKER: kafka:9092
-      KAFKA_TOPIC: fhir-patients
-      FHIR_BASE: http://hapi-fhir:8080/fhir
-      CONSUMER_TIMEOUT_MS: "15000"
+      KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-fhir-patients}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-fhir-patients-dlq}
+      HAPI_BASE_URL: ${HAPI_BASE_URL:-http://hapi-fhir:8080/fhir}
+      CONSUMER_TIMEOUT_MS: ${CONSUMER_TIMEOUT_MS:-15000}
+      HAPI_RETRY_ATTEMPTS: ${HAPI_RETRY_ATTEMPTS:-30}
+      HAPI_RETRY_DELAY: ${HAPI_RETRY_DELAY:-2}
+      FHIR_POST_MAX_RETRIES: ${FHIR_POST_MAX_RETRIES:-5}
+      FHIR_POST_BACKOFF: ${FHIR_POST_BACKOFF:-0.5}
+      METRICS_PORT: ${METRICS_PORT:-8001}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       etl-producer:
         condition: service_completed_successfully
     restart: "no"
-    command: ["python", "/opt/app/kafka_consumer.py"]
+    command: ["python", "-m", "etl.kafka_consumer"]
 
 volumes:
   pgdata:
