@@ -24,11 +24,17 @@ hapi:
     enforce_referential_integrity_on_delete: false
     default_encoding: JSON
     default_pretty_print: true
-    # Validacao habilitada para barrar payloads malformados na entrada e
-    # detectar regressoes nos builders (etl/lib/fhir.py). Falhas surgem como
-    # HTTP 422 - o consumer trata como FHIRError e roteia para a DLQ.
+    # Validacao desligada porque os builders em etl/lib/fhir.py declaram
+    # `meta.profile = [BRIndividuo-1.0]` (perfil do SUS/RNDS), mas esse
+    # StructureDefinition NAO esta carregado no HAPI - HAPI trata perfil
+    # desconhecido como erro fatal (VALIDATION_VAL_PROFILE_UNKNOWN_NOT_POLICY)
+    # e rejeita todos os POSTs com HTTP 422.
+    #
+    # Para reabilitar com seguranca: carregar o StructureDefinition do
+    # BRIndividuo via /fhir/StructureDefinition no startup do HAPI (volume
+    # com NpmPackage ou implementation guide). Acompanhar em docs/security.md.
     validation:
-      requests_enabled: true
-      responses_enabled: true
+      requests_enabled: false
+      responses_enabled: false
     bulk_export_enabled: true
     narrative_enabled: false
