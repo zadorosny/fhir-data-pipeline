@@ -55,22 +55,30 @@ services:
       - ./hapi/application.yaml:/app/config/application.yaml:ro
     ports:
       - "${HAPI_PORT:-8080}:8080"
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/fhir/metadata"]
-      interval: 15s
-      timeout: 10s
-      retries: 20
-      start_period: 60s
+    # Imagem distroless (USER 65532) sem shell/curl/wget - sonda HTTP precisa
+    # vir de fora. Readiness e garantida pelo sidecar `hapi-ready` abaixo.
     logging: *default-logging
     restart: unless-stopped
 
+  # Sidecar de readiness: aguarda HAPI responder ao /fhir/metadata. Servicos
+  # downstream (producer, consumer) usam `depends_on: condition:
+  # service_completed_successfully` para serializar o startup.
   hapi-ready:
     image: curlimages/curl:8.10.1
     container_name: fhir_hapi_ready
     depends_on:
-      hapi-fhir:
-        condition: service_healthy
-    command: ["true"]
+      - hapi-fhir
+    command:
+      - sh
+      - -c
+      - |
+        for i in $$(seq 1 60); do
+          if curl -sf http://hapi-fhir:8080/fhir/metadata > /dev/null; then
+            echo "HAPI ready after $$i attempt(s)"; exit 0
+          fi
+          sleep 5
+        done
+        echo "HAPI did not become ready in 5 minutes"; exit 1
     restart: "no"
     logging: *default-logging
 
