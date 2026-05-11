@@ -43,6 +43,21 @@ def test_metrics_port_fora_da_faixa(monkeypatch: pytest.MonkeyPatch) -> None:
         ETLSettings()
 
 
+@pytest.mark.parametrize("encoding", ["ISO-8859-1", "UTF-8", "UTF-8-SIG", "Windows-1252"])
+def test_csv_encoding_valido_aceita(monkeypatch: pytest.MonkeyPatch, encoding: str) -> None:
+    monkeypatch.setenv("CSV_ENCODING", encoding)
+    s = ETLSettings()
+    assert s.csv_encoding == encoding
+
+
+def test_csv_encoding_invalido_levanta(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("CSV_ENCODING", "latin1")
+    with pytest.raises(ValidationError):
+        ETLSettings()
+
+
 def test_get_settings_cacheia() -> None:
     a = get_settings()
     b = get_settings()
