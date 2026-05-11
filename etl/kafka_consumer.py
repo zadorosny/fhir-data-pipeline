@@ -1,272 +1,197 @@
-"""
-Consumer: Lê mensagens do tópico Kafka 'fhir-patients'
-e carrega os Resources Patient e Condition no HAPI FHIR.
+"""Consumer: le mensagens do topico Kafka e carrega Patient/Condition no HAPI FHIR.
 
-Utiliza conditional create (If-None-Exist) para idempotência:
-re-execuções não geram duplicatas.
+Idempotente via If-None-Exist; falhas definitivas vao para a DLQ.
+Metricas expostas em :METRICS_PORT/metrics.
 """
+
+from __future__ import annotations
 
 import json
-import os
+import logging
+import sys
 import time
-from datetime import datetime
+from typing import Any
 
-import requests
 from kafka import KafkaConsumer
 
-KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
-FHIR_BASE = os.getenv("FHIR_BASE", "http://hapi-fhir:8080/fhir")
-TOPIC = os.getenv("KAFKA_TOPIC", "fhir-patients")
-CONSUMER_TIMEOUT_MS = int(os.getenv("CONSUMER_TIMEOUT_MS", "15000"))
-
-HEADERS = {
-    "Content-Type": "application/fhir+json",
-    "Accept": "application/fhir+json",
-}
-
-BR_INDIVIDUO_PROFILE = (
-    "http://www.saude.gov.br/fhir/r4/StructureDefinition/BRIndividuo-1.0"
+from etl.lib.config import get_settings
+from etl.lib.dlq import make_dlq_producer, publish_to_dlq
+from etl.lib.fhir import (
+    FHIRError,
+    OBSERVATION_MAP,
+    build_condition_resource,
+    build_patient_resource,
+    build_session,
+    condition_search_criteria,
+    patient_search_criteria,
+    post_resource,
+    wait_for_fhir,
 )
-CPF_SYSTEM = "http://rnds-fhir.saude.gov.br/fhir/r4/NamingSystem/cpf"
-
-OBSERVATION_MAP = {
-    "Gestante": {
-        "snomed_code": "77386006",
-        "snomed_display": "Pregnant (finding)",
-        "icd10_code": "Z33",
-        "icd10_display": "Pregnant state",
-        "text": "Gestante",
-    },
-    "Diabético": {
-        "snomed_code": "73211009",
-        "snomed_display": "Diabetes mellitus (disorder)",
-        "icd10_code": "E14",
-        "icd10_display": "Unspecified diabetes mellitus",
-        "text": "Diabetes",
-    },
-    "Hipertenso": {
-        "snomed_code": "38341003",
-        "snomed_display": "Hypertensive disorder (disorder)",
-        "icd10_code": "I10",
-        "icd10_display": "Essential (primary) hypertension",
-        "text": "Hipertensão",
-    },
-}
+from etl.lib.logging_setup import configure_logging
+from etl.lib.metrics import dlq_total, messages_total, post_latency, start_metrics_server
+from etl.lib.transform import split_observations
 
 
-def parse_date(date_str: str) -> str:
+def process_patient(
+    session: Any,
+    base_url: str,
+    data: dict[str, Any],
+    logger: logging.Logger,
+) -> str | None:
+    """Cria/recupera o Patient. Retorna patient_ref ou None em erro definitivo."""
+    patient = build_patient_resource(data)
+    criteria = patient_search_criteria(data.get("cpf", ""))
+    start = time.perf_counter()
     try:
-        return datetime.strptime(date_str.strip(), "%d/%m/%Y").strftime("%Y-%m-%d")
-    except (ValueError, AttributeError):
-        return "1900-01-01"
-
-
-def clean_cpf(cpf: str) -> str:
-    return cpf.replace(".", "").replace("-", "").strip()
-
-
-def map_gender(genero: str) -> str:
-    g = genero.strip().lower()
-    if g == "masculino":
-        return "male"
-    elif g == "feminino":
-        return "female"
-    return "unknown"
-
-
-def build_patient(data: dict) -> dict:
-    parts = data["nome"].strip().split()
-    given = parts[:-1] if len(parts) > 1 else parts
-    family = parts[-1] if len(parts) > 1 else ""
-
-    return {
-        "resourceType": "Patient",
-        "meta": {"profile": [BR_INDIVIDUO_PROFILE]},
-        "identifier": [
-            {"use": "official", "system": CPF_SYSTEM, "value": clean_cpf(data["cpf"])}
-        ],
-        "active": True,
-        "name": [{"use": "official", "family": family, "given": given}],
-        "gender": map_gender(data["genero"]),
-        "birthDate": parse_date(data["data_nascimento"]),
-        "telecom": [{"system": "phone", "value": data["telefone"].strip(), "use": "mobile"}],
-        "extension": [
-            {
-                "url": "http://hl7.org/fhir/StructureDefinition/patient-birthPlace",
-                "valueAddress": {"country": data["pais"].strip()},
-            }
-        ],
-    }
-
-
-def build_condition(patient_ref: str, obs_key: str) -> dict | None:
-    info = OBSERVATION_MAP.get(obs_key)
-    if info is None:
+        body, created = post_resource(
+            session, base_url, patient, if_none_exist=criteria
+        )
+    except FHIRError as exc:
+        logger.error(
+            "Falha definitiva ao criar Patient",
+            extra={
+                "event": "patient_failed",
+                "cpf": data.get("cpf"),
+                "status": exc.status_code,
+                "body": exc.body,
+            },
+        )
+        messages_total.labels(resource="Patient", status="error").inc()
         return None
+    finally:
+        post_latency.labels(resource="Patient").observe(time.perf_counter() - start)
 
-    return {
-        "resourceType": "Condition",
-        "clinicalStatus": {
-            "coding": [
-                {
-                    "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
-                    "code": "active",
-                    "display": "Active",
-                }
-            ]
+    status = "created" if created else "exists"
+    messages_total.labels(resource="Patient", status=status).inc()
+    logger.info(
+        "Patient processado",
+        extra={
+            "event": "patient_ok",
+            "cpf": data.get("cpf"),
+            "status": status,
+            "id": body.get("id"),
         },
-        "verificationStatus": {
-            "coding": [
-                {
-                    "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
-                    "code": "confirmed",
-                    "display": "Confirmed",
-                }
-            ]
-        },
-        "category": [
-            {
-                "coding": [
-                    {
-                        "system": "http://terminology.hl7.org/CodeSystem/condition-category",
-                        "code": "problem-list-item",
-                        "display": "Problem List Item",
-                    }
-                ]
-            }
-        ],
-        "code": {
-            "coding": [
-                {
-                    "system": "http://snomed.info/sct",
-                    "code": info["snomed_code"],
-                    "display": info["snomed_display"],
-                },
-                {
-                    "system": "http://hl7.org/fhir/sid/icd-10",
-                    "code": info["icd10_code"],
-                    "display": info["icd10_display"],
-                },
-            ],
-            "text": info["text"],
-        },
-        "subject": {"reference": patient_ref},
-    }
+    )
+    return f"Patient/{body['id']}"
 
 
-def wait_for_fhir():
-    """Aguarda o servidor FHIR estar disponível."""
-    for attempt in range(30):
+def process_conditions(
+    session: Any,
+    base_url: str,
+    patient_ref: str,
+    observations: list[str],
+    logger: logging.Logger,
+) -> int:
+    """Cria Conditions vinculados ao Patient. Retorna numero de erros."""
+    errors = 0
+    for obs_key in observations:
+        info = OBSERVATION_MAP.get(obs_key)
+        if not info:
+            logger.warning(
+                "Observacao desconhecida",
+                extra={"event": "obs_unknown", "obs": obs_key, "patient": patient_ref},
+            )
+            continue
+        cond = build_condition_resource(patient_ref, obs_key)
+        if cond is None:
+            continue
+        criteria = condition_search_criteria(patient_ref, info["snomed_code"])
+        start = time.perf_counter()
         try:
-            resp = requests.get(f"{FHIR_BASE}/metadata", timeout=5)
-            if resp.status_code == 200:
-                print(f"  FHIR disponível (tentativa {attempt + 1})")
-                return
-        except requests.ConnectionError:
-            pass
-        time.sleep(2)
-    raise RuntimeError("Servidor FHIR não disponível após 60 segundos")
+            _, created = post_resource(
+                session, base_url, cond, if_none_exist=criteria
+            )
+            status = "created" if created else "exists"
+            messages_total.labels(resource="Condition", status=status).inc()
+        except FHIRError as exc:
+            errors += 1
+            messages_total.labels(resource="Condition", status="error").inc()
+            logger.error(
+                "Falha ao criar Condition",
+                extra={
+                    "event": "condition_failed",
+                    "obs": obs_key,
+                    "patient": patient_ref,
+                    "status": exc.status_code,
+                },
+            )
+        finally:
+            post_latency.labels(resource="Condition").observe(time.perf_counter() - start)
+    return errors
 
 
-def post_resource(resource: dict, if_none_exist: str | None = None) -> tuple[dict | None, bool]:
-    """Cria resource no FHIR. Retorna (resource, criado).
+def main() -> int:
+    settings = get_settings()
+    logger = configure_logging(settings.log_level, service="fhir-consumer")
+    start_metrics_server(settings.metrics_port)
 
-    Com if_none_exist (conditional create):
-      - 201: recurso criado (novo)
-      - 200: recurso já existia (skip)
-    """
-    rtype = resource["resourceType"]
-    url = f"{FHIR_BASE}/{rtype}"
-    headers = HEADERS.copy()
-    if if_none_exist:
-        headers["If-None-Exist"] = if_none_exist
-
-    resp = requests.post(url, json=resource, headers=headers, timeout=30)
-    if resp.status_code == 201:
-        return resp.json(), True
-    if resp.status_code == 200:
-        return resp.json(), False
-    print(f"  ERRO {resp.status_code} ao criar {rtype}: {resp.text[:300]}")
-    return None, False
-
-
-def main():
-    print("=" * 60)
-    print("CONSUMER — Kafka → HAPI FHIR")
-    print(f"  KAFKA_BROKER : {KAFKA_BROKER}")
-    print(f"  FHIR_BASE    : {FHIR_BASE}")
-    print(f"  TOPIC        : {TOPIC}")
-    print("=" * 60)
-
-    wait_for_fhir()
-
-    consumer = KafkaConsumer(
-        TOPIC,
-        bootstrap_servers=KAFKA_BROKER,
-        auto_offset_reset="earliest",
-        consumer_timeout_ms=CONSUMER_TIMEOUT_MS,
-        value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+    logger.info(
+        "Consumer iniciado",
+        extra={
+            "event": "consumer_start",
+            "kafka_broker": settings.kafka_broker,
+            "fhir_base": settings.fhir_base,
+            "topic": settings.kafka_topic,
+        },
     )
 
-    patients_ok = 0
-    patients_skip = 0
-    conditions_ok = 0
-    conditions_skip = 0
-    errors = 0
+    session = build_session(
+        max_retries=settings.fhir_post_max_retries,
+        backoff_factor=settings.fhir_post_backoff,
+    )
+    wait_for_fhir(
+        session,
+        settings.fhir_base,
+        attempts=settings.hapi_retry_attempts,
+        delay=settings.hapi_retry_delay,
+    )
 
-    for message in consumer:
-        data = message.value
-        nome = data.get("nome", "?")
-        cpf = clean_cpf(data.get("cpf", ""))
-        print(f"\n[offset {message.offset}] {nome}")
+    consumer = KafkaConsumer(
+        settings.kafka_topic,
+        bootstrap_servers=settings.kafka_broker,
+        auto_offset_reset="earliest",
+        consumer_timeout_ms=settings.consumer_timeout_ms,
+        enable_auto_commit=False,
+        value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+    )
+    dlq_producer = make_dlq_producer(settings.kafka_broker)
 
-        patient = build_patient(data)
-        condition_criteria = f"identifier={CPF_SYSTEM}|{cpf}"
-        result, created = post_resource(patient, if_none_exist=condition_criteria)
-        if result is None:
-            errors += 1
-            continue
-        patient_ref = f"Patient/{result['id']}"
-        if created:
-            patients_ok += 1
-        else:
-            patients_skip += 1
-            print(f"  Paciente já existe: {patient_ref}")
+    totals = {"patient_ok": 0, "patient_dlq": 0, "condition_err": 0}
+    try:
+        for message in consumer:
+            data = message.value
+            logger.debug(
+                "Mensagem recebida",
+                extra={"event": "msg_received", "offset": message.offset},
+            )
+            patient_ref = process_patient(session, settings.fhir_base, data, logger)
+            if patient_ref is None:
+                publish_to_dlq(
+                    dlq_producer,
+                    settings.kafka_dlq_topic,
+                    data,
+                    reason="patient_post_failed",
+                )
+                dlq_total.inc()
+                totals["patient_dlq"] += 1
+                consumer.commit()
+                continue
 
-        obs = data.get("observacao", "").strip()
-        if obs:
-            for obs_key in obs.split("|"):
-                obs_key = obs_key.strip()
-                if not obs_key:
-                    continue
-                info = OBSERVATION_MAP.get(obs_key)
-                if not info:
-                    continue
-                cond = build_condition(patient_ref, obs_key)
-                if cond:
-                    cond_criteria = f"subject={patient_ref}&code=http://snomed.info/sct|{info['snomed_code']}"
-                    r, cond_created = post_resource(cond, if_none_exist=cond_criteria)
-                    if r:
-                        if cond_created:
-                            conditions_ok += 1
-                        else:
-                            conditions_skip += 1
-                            print(f"  Condition já existe: {obs_key}")
-                    else:
-                        errors += 1
+            totals["patient_ok"] += 1
+            observations = split_observations(data.get("observacao"))
+            cond_errors = process_conditions(
+                session, settings.fhir_base, patient_ref, observations, logger
+            )
+            totals["condition_err"] += cond_errors
+            consumer.commit()
+    finally:
+        consumer.close()
+        dlq_producer.close(timeout=5)
+        session.close()
 
-    consumer.close()
-
-    print("\n" + "=" * 60)
-    print("RESUMO DA CARGA")
-    print("=" * 60)
-    print(f"  Pacientes criados (Patient):    {patients_ok}")
-    print(f"  Pacientes existentes (skip):    {patients_skip}")
-    print(f"  Condições criadas (Condition):   {conditions_ok}")
-    print(f"  Condições existentes (skip):     {conditions_skip}")
-    print(f"  Erros:                           {errors}")
-    print("=" * 60)
+    logger.info("Consumer concluido", extra={"event": "consumer_done", **totals})
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

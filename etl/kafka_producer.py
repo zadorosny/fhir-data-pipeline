@@ -1,98 +1,117 @@
+"""Producer: PySpark le o CSV de pacientes e publica cada registro
+como mensagem JSON no topico Kafka configurado.
+
+Usa funcoes puras de etl.lib.transform para parsing e mapeamento de colunas
+(testavel sem subir Spark/Kafka).
 """
-Producer: PySpark lê o CSV de pacientes e publica cada registro
-como mensagem JSON no tópico Kafka 'fhir-patients'.
-"""
+
+from __future__ import annotations
 
 import json
-import os
+import logging
+import sys
+from typing import Any
 
 from kafka import KafkaProducer
+from kafka.errors import KafkaError
 from pyspark.sql import SparkSession
 
-KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
-TOPIC = os.getenv("KAFKA_TOPIC", "fhir-patients")
-CSV_PATH = os.getenv("CSV_PATH", "/opt/app/data/patients.csv")
-CSV_ENCODING = os.getenv("CSV_ENCODING", "ISO-8859-1")
+from etl.lib.config import get_settings
+from etl.lib.logging_setup import configure_logging
+from etl.lib.transform import (
+    ColumnMappingError,
+    build_column_map,
+    row_to_message,
+)
 
 
-def normalize_columns(df):
-    """Normaliza nomes de colunas (remove acentos, BOM)."""
-    col_map = {}
-    for c in df.columns:
-        clean = c.strip().replace("\ufeff", "")
-        if "Nome" in clean:
-            col_map[c] = "Nome"
-        elif "CPF" in clean:
-            col_map[c] = "CPF"
-        elif "nero" in clean or "Genero" in clean or "Gênero" in clean:
-            col_map[c] = "Genero"
-        elif "Nascimento" in clean and "Data" in clean:
-            col_map[c] = "DataNascimento"
-        elif "Telefone" in clean:
-            col_map[c] = "Telefone"
-        elif "Pa" in clean and "s" in clean:
-            col_map[c] = "Pais"
-        elif "Observa" in clean:
-            col_map[c] = "Observacao"
-        else:
-            col_map[c] = clean
-    for old, new in col_map.items():
-        df = df.withColumnRenamed(old, new)
-    return df
+def make_producer(broker: str) -> KafkaProducer:
+    """Producer com semantica at-least-once + ordem preservada por particao."""
+    return KafkaProducer(
+        bootstrap_servers=broker,
+        value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+        acks="all",
+        retries=5,
+        linger_ms=50,
+        batch_size=32 * 1024,
+        max_in_flight_requests_per_connection=1,
+    )
 
 
-def main():
-    print("=" * 60)
-    print("PRODUCER — PySpark → Kafka")
-    print(f"  KAFKA_BROKER : {KAFKA_BROKER}")
-    print(f"  TOPIC        : {TOPIC}")
-    print(f"  CSV_PATH     : {CSV_PATH}")
-    print("=" * 60)
+def read_csv(spark: SparkSession, path: str, encoding: str) -> list[dict[str, Any]]:
+    df = (
+        spark.read.option("header", "true")
+        .option("encoding", encoding)
+        .option("sep", ",")
+        .csv(path)
+    )
+    column_map = build_column_map(df.columns)
+    for original, canonical in column_map.items():
+        if original != canonical:
+            df = df.withColumnRenamed(original, canonical)
+    return [row.asDict(recursive=True) for row in df.collect()]
+
+
+def main() -> int:
+    settings = get_settings()
+    logger = configure_logging(settings.log_level, service="fhir-producer")
+    logger.info(
+        "Producer iniciado",
+        extra={
+            "event": "producer_start",
+            "kafka_broker": settings.kafka_broker,
+            "topic": settings.kafka_topic,
+            "csv_path": settings.csv_path,
+        },
+    )
 
     spark = (
-        SparkSession.builder
-        .appName("FHIR-Kafka-Producer")
+        SparkSession.builder.appName("FHIR-Kafka-Producer")
         .master("local[*]")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    df = (
-        spark.read
-        .option("header", "true")
-        .option("encoding", CSV_ENCODING)
-        .option("sep", ",")
-        .csv(CSV_PATH)
-    )
-    df = normalize_columns(df)
+    try:
+        rows = read_csv(spark, settings.csv_path, settings.csv_encoding)
+    except ColumnMappingError as exc:
+        logger.error(
+            "CSV invalido", extra={"event": "csv_invalid", "error": str(exc)}
+        )
+        spark.stop()
+        return 2
 
-    rows = df.collect()
-    print(f"\nTotal de registros no CSV: {len(rows)}")
-
-    producer = KafkaProducer(
-        bootstrap_servers=KAFKA_BROKER,
-        value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+    logger.info(
+        "CSV carregado", extra={"event": "csv_loaded", "rows": len(rows)}
     )
 
-    for row in rows:
-        message = {
-            "nome": row["Nome"],
-            "cpf": row["CPF"],
-            "genero": row["Genero"],
-            "data_nascimento": row["DataNascimento"],
-            "telefone": row["Telefone"],
-            "pais": row["Pais"],
-            "observacao": row["Observacao"] or "",
-        }
-        producer.send(TOPIC, value=message)
+    producer = make_producer(settings.kafka_broker)
+    sent = 0
+    try:
+        for row in rows:
+            message = row_to_message(row)
+            producer.send(settings.kafka_topic, value=message)
+            sent += 1
+        producer.flush(timeout=30)
+    except KafkaError as exc:
+        logger.error(
+            "Falha no envio Kafka",
+            extra={"event": "kafka_send_failed", "sent": sent, "error": str(exc)},
+        )
+        producer.close(timeout=5)
+        spark.stop()
+        return 3
+    finally:
+        producer.close(timeout=5)
+        spark.stop()
 
-    producer.flush()
-    producer.close()
-    spark.stop()
-
-    print(f"Publicadas {len(rows)} mensagens no tópico '{TOPIC}'")
-    print("=" * 60)
+    logger.info(
+        "Producer concluido",
+        extra={"event": "producer_done", "sent": sent, "topic": settings.kafka_topic},
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    logging.captureWarnings(True)
+    sys.exit(main())
