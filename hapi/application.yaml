@@ -24,8 +24,11 @@ hapi:
     enforce_referential_integrity_on_delete: false
     default_encoding: JSON
     default_pretty_print: true
+    # Validacao habilitada para barrar payloads malformados na entrada e
+    # detectar regressoes nos builders (etl/lib/fhir.py). Falhas surgem como
+    # HTTP 422 - o consumer trata como FHIRError e roteia para a DLQ.
     validation:
-      requests_enabled: false
-      responses_enabled: false
+      requests_enabled: true
+      responses_enabled: true
     bulk_export_enabled: true
     narrative_enabled: false
