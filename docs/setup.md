@@ -1,164 +1,124 @@
-# Documentação Detalhada — Configuração e Carga FHIR
+# Setup detalhado
 
-## Parte 1 — Configuração do Servidor FHIR
+> Este documento descreve cada componente do `docker-compose.yml`. Para visão de mais alto nível, veja [architecture.md](architecture.md). Para deploy em produção, [deployment.md](deployment.md). Para problemas comuns, [troubleshooting.md](troubleshooting.md).
 
-### Componentes da infraestrutura
+## Pré-requisitos
 
-O ambiente é orquestrado por um único `docker-compose.yml` com os seguintes serviços:
+- Docker Engine 24+ e Docker Compose v2
+- Portas livres: 5432, 8001, 8080, 8081, 9091, 9092 (e 3000/9090 com profile `monitoring`)
 
-| Serviço         | Papel                                                                   |
-|-----------------|-------------------------------------------------------------------------|
-| **postgres**    | Banco de dados compartilhado entre HAPI FHIR e Airflow                 |
-| **hapi-fhir**   | Servidor FHIR R4 (API REST em `/fhir`)                                |
-| **hapi-ready**  | Sidecar que faz polling até o HAPI responder — garante ordem de início |
-| **kafka**       | Broker de mensagens (modo KRaft) — intermedia o fluxo CSV → FHIR      |
-| **kafka-ui**    | Interface web para visualização de tópicos e mensagens do Kafka        |
-| **airflow**     | Orquestrador de workflows — DAG para re-execução sob demanda          |
-| **etl-producer**| PySpark: lê o CSV e publica mensagens JSON no Kafka                    |
-| **etl-consumer**| Consome mensagens do Kafka e carrega no HAPI FHIR                      |
+## Configuração inicial (`.env`)
+
+```bash
+cp .env.example .env
+```
+
+Variáveis **obrigatórias** (compose falha sem elas):
+
+| Variável                            | O que é                                       |
+|-------------------------------------|-----------------------------------------------|
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Owner do banco; usado pelo HAPI |
+| `AIRFLOW_DB_USER` / `AIRFLOW_DB_PASSWORD`             | Role dedicada para o Airflow (menor privilégio) |
+| `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD`       | Login do painel Airflow                       |
+| `AIRFLOW__CORE__FERNET_KEY`                           | `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+| `AIRFLOW__WEBSERVER__SECRET_KEY`                      | `openssl rand -hex 32`                        |
+
+Variáveis **opcionais** (têm defaults razoáveis): portas, retries, timeouts, level de log, webhook de alerta. Veja `.env.example`.
+
+## Componentes
 
 ### PostgreSQL
 
-- Imagem: `postgres:15`
-- O script `postgres/init-airflow.sql` cria um schema separado para o Airflow não misturar tabelas com o HAPI FHIR.
-- O healthcheck (`pg_isready`) garante que o banco está pronto antes de iniciar o HAPI e o Airflow.
+- Imagem: `postgres:15`.
+- Volume nomeado `pgdata` mantém os dados entre restarts.
+- O script `postgres/init-db.sh` roda **uma única vez** no primeiro start (volume vazio):
+  - Cria a role `airflow_user` com senha do `.env`
+  - Cria o schema `airflow` com `AUTHORIZATION airflow_user`
+  - Define `search_path` da role para `airflow`
+- HAPI usa o schema `public` (auto-DDL via Hibernate); Airflow usa o schema `airflow` via `airflow_user`.
 
 ### HAPI FHIR
 
-- Imagem: `hapiproject/hapi:latest`
-- Configurado via `hapi/application.yaml` montado em `/app/config/application.yaml`.
-- Conecta ao PostgreSQL via JDBC (`jdbc:postgresql://postgres:5432/fhir`).
-- A conexão com o banco e as credenciais também são passadas via variáveis de ambiente no `docker-compose.yml` para garantir que o Spring Boot as utilize.
-- O Flyway foi **desabilitado** no `application.yaml` (`spring.flyway.enabled: false`) para evitar incompatibilidade com a versão do PostgreSQL. O HAPI gerencia o schema via Hibernate auto-DDL.
+- Imagem: `hapiproject/hapi:latest`.
+- Config: `hapi/application.yaml` montado em `/app/config/application.yaml`.
+- Conexão JDBC: `SPRING_DATASOURCE_URL/USERNAME/PASSWORD` vêm do compose via env (Spring placeholders no YAML).
+- Flyway desabilitado (`spring.flyway.enabled: false`); schema é criado pelo Hibernate auto-DDL.
+- Healthcheck `curl -sf /fhir/metadata` com `start_period: 60s`.
 
 ### Kafka
 
-- Imagem: `apache/kafka:3.8.0`
-- Configurado em modo KRaft (sem Zookeeper).
-- O Producer publica cada paciente como mensagem JSON no tópico `fhir-patients`.
-- O Consumer lê as mensagens do tópico, constrói os Resources FHIR e envia via POST para o HAPI.
-- Esse desacoplamento permite reprocessamento, escalabilidade e observabilidade via Kafka UI.
+- Imagem: `apache/kafka:3.8.0` em modo KRaft (sem ZooKeeper).
+- Tópicos auto-criados (`KAFKA_AUTO_CREATE_TOPICS_ENABLE=true`).
+- Healthcheck via `kafka-topics --list`.
 
 ### Kafka UI
 
-- Imagem: `provectuslabs/kafka-ui:latest`
-- Porta: `9091`
-- Permite visualizar tópicos, mensagens, offsets e consumer groups.
-- Acesse http://localhost:9091 para verificar as mensagens publicadas no tópico `fhir-patients`.
+- Imagem: `provectuslabs/kafka-ui`, porta 9091.
+- Útil para inspecionar a `fhir-patients-dlq` em caso de falhas.
 
 ### Airflow
 
-- Imagem: `apache/airflow:2.10.0-python3.12`
-- Executor: `LocalExecutor` (usa o PostgreSQL como backend).
-- A DAG `fhir_patient_etl` (`airflow/dags/fhir_etl_dag.py`) é disparada manualmente via UI ou CLI.
-- O pipeline inicial roda automaticamente via Docker Compose; a DAG permite re-execuções sob demanda.
-- A DAG executa `docker start -a` nos containers `fhir_producer` e `fhir_consumer` em sequência.
-- O Consumer é idempotente (verifica duplicatas por CPF e código SNOMED CT), permitindo re-execuções seguras.
-- Credenciais padrão: `admin` / `admin`.
+- Imagem: `apache/airflow:2.10.0-python3.12`, `LocalExecutor`.
+- Webserver e scheduler no mesmo container (OK para dev; ver `docs/deployment.md` para escalar).
+- Bootstrap: `airflow db init` + `airflow users create` (lê `AIRFLOW_ADMIN_*` do env).
+- DAG `fhir_patient_etl` é re-executável via UI/CLI; falhas chamam `alert_on_failure` (POST para `ALERT_WEBHOOK_URL`).
+- ⚠️ Monta `/var/run/docker.sock` para acionar os ETLs via `docker start -a` — veja `docs/security.md`.
 
-### Passo a passo para subir o ambiente
+### ETL — Producer
 
-```bash
-# 1. Clonar o repositório
-git clone https://github.com/zadorosny/fhir-data-pipeline.git
-cd fhir-data-pipeline
+- Build: `etl/Dockerfile` (Python 3.12 slim + JRE + `requirements.txt` pinado).
+- Entry: `python -m etl.kafka_producer`.
+- Lê `CSV_PATH` (`/opt/app/data/patients.csv` por default), normaliza colunas, publica em `KAFKA_TOPIC` com `acks=all`, `retries=5`, `max_in_flight=1`.
+- Falha rápido se colunas obrigatórias não existirem (`ColumnMappingError`, exit 2).
 
-# 2. Subir tudo (build da imagem ETL + start dos serviços)
-docker-compose up -d --build
+### ETL — Consumer
 
-# 3. Verificar que o HAPI está respondendo
-curl http://localhost:8080/fhir/metadata
+- Mesma imagem do producer; entry: `python -m etl.kafka_consumer`.
+- Polling em `/fhir/metadata` (parâmetros `HAPI_RETRY_ATTEMPTS`/`HAPI_RETRY_DELAY`).
+- `requests.Session` + `urllib3.Retry` com backoff exponencial (5xx/429/conn errors).
+- Conditional create com `If-None-Exist` para idempotência.
+- Falha definitiva → publica no `KAFKA_DLQ_TOPIC` com headers `reason`, `status_code`, `body_preview`.
+- Expõe `/metrics` em `METRICS_PORT` (8001 por default) com `fhir_consumer_messages_total`, `fhir_consumer_post_latency_seconds`, `fhir_consumer_dlq_total`.
 
-# 4. Acompanhar o Producer (CSV → Kafka)
-docker logs -f fhir_producer
-
-# 5. Acompanhar o Consumer (Kafka → HAPI FHIR)
-docker logs -f fhir_consumer
-
-# 6. Parar o ambiente
-docker-compose down
-
-# 7. Parar e remover volumes (limpa os dados)
-docker-compose down -v
-```
-
----
-
-## Parte 2 — Pipeline de Carga de Dados
-
-### Fluxo do ETL
-
-```
-CSV  →  PySpark (Producer)  →  Kafka (tópico fhir-patients)  →  Consumer  →  HAPI FHIR
-```
-
-1. O container `hapi-ready` faz polling com `curl --retry 90` até o HAPI responder em `/fhir/metadata`.
-2. Quando o `hapi-ready` termina com sucesso (exit 0) e o Kafka está saudável (healthcheck), o container `etl-producer` é iniciado.
-3. O **Producer** (PySpark) lê o arquivo `data/patients.csv` (encoding ISO-8859-1).
-4. Os nomes das colunas são normalizados (remoção de acentos e BOM).
-5. Para cada linha, uma mensagem JSON é publicada no tópico Kafka `fhir-patients`.
-6. Quando o Producer finaliza, o container `etl-consumer` é iniciado.
-7. O **Consumer** lê as mensagens do Kafka e, para cada uma, constrói um Resource **Patient** (perfil BRIndivíduo) e envia via `POST /fhir/Patient`.
-8. Se a coluna "Observação" tiver valor, cada observação (separada por `|`) gera um Resource **Condition** vinculado ao Patient recém-criado.
-
-### Mapeamento CSV → FHIR Patient
-
-O Resource Patient utiliza o perfil **BRIndivíduo** da RNDS:
-- **Profile**: `http://www.saude.gov.br/fhir/r4/StructureDefinition/BRIndividuo-1.0`
-- **CPF**: Identificador oficial com system `http://rnds-fhir.saude.gov.br/fhir/r4/NamingSystem/cpf`
-
-| Coluna CSV           | Campo FHIR                       |
-|----------------------|----------------------------------|
-| Nome                 | `Patient.name.given` + `family`  |
-| CPF                  | `Patient.identifier`             |
-| Gênero               | `Patient.gender`                 |
-| Data de Nascimento   | `Patient.birthDate`              |
-| Telefone             | `Patient.telecom`                |
-| País de Nascimento   | `Patient.extension` (birthPlace) |
-
-### Mapeamento Observação → FHIR Condition
-
-| Observação   | SNOMED CT  | ICD-10 |
-|-------------|-----------|--------|
-| Gestante    | 77386006  | Z33    |
-| Diabético   | 73211009  | E14    |
-| Hipertenso  | 38341003  | I10    |
-
-Cada Condition inclui codificação dupla (SNOMED CT + ICD-10), `clinicalStatus: active`, `verificationStatus: confirmed` e referência ao Patient via `subject`.
-
-### Dockerfile do ETL
-
-```dockerfile
-FROM python:3.12-slim
-RUN apt-get update && apt-get install -y --no-install-recommends default-jre-headless
-ENV JAVA_HOME=/usr/lib/jvm/default-java
-RUN pip install pyspark==3.5.3 requests==2.31.0 kafka-python-ng==2.2.3
-COPY kafka_producer.py kafka_consumer.py /opt/app/
-```
-
-A imagem base é Python 3.12 slim com JRE headless (necessário para o Spark). As dependências são PySpark, requests e kafka-python-ng (fork mantido do kafka-python).
-
-### Resultado esperado da carga
-
-```
-Pacientes criados (Patient):   50
-Condições criadas (Condition):  15
-Erros:                          0
-```
-
-### Verificação via Kafka UI
-
-Acesse http://localhost:9091 para visualizar o tópico `fhir-patients` com as 50 mensagens publicadas pelo Producer. Cada mensagem contém o JSON de um paciente com os campos: nome, cpf, gênero, data_nascimento, telefone, país e observação.
-
-### Verificação via HAPI FHIR
+## Como subir / parar
 
 ```bash
-# Total de pacientes (deve ser 50)
-curl http://localhost:8080/fhir/Patient?_summary=count
+# Stack core
+docker compose --env-file .env up -d --build
+docker compose --env-file .env down            # mantém volumes
+docker compose --env-file .env down -v         # zera volumes (Postgres + Kafka)
 
-# Total de condições clínicas (deve ser 15)
-curl http://localhost:8080/fhir/Condition?_summary=count
-
-# Buscar paciente por CPF
-curl "http://localhost:8080/fhir/Patient?identifier=12345678900"
+# Stack core + monitoring (Prometheus + Grafana)
+docker compose -f docker-compose.yml -f docker-compose.observability.yml \
+               --env-file .env --profile monitoring up -d
 ```
+
+## Verificação rápida
+
+```bash
+docker compose ps                                   # status + healthchecks
+docker compose logs --tail=50 etl-consumer          # carga concluída?
+curl -fsS http://localhost:8080/fhir/Patient?_summary=count
+curl -fsS http://localhost:8080/fhir/Condition?_summary=count
+curl -fsS http://localhost:8001/metrics | grep fhir_consumer_messages_total
+```
+
+Resultado esperado para o CSV de exemplo:
+
+```
+Patient   total: 50
+Condition total: 15
+DLQ       total: 0
+```
+
+## Re-executar via Airflow
+
+1. Abra http://localhost:8081 (login com `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD`).
+2. Acione a DAG `fhir_patient_etl`.
+3. Tasks `kafka_producer` → `kafka_consumer` rodam em sequência. Como o consumer é idempotente, os totais não mudam — apenas linhas "exists" aparecem nos logs.
+
+## Próximos passos
+
+- Em produção: leia `docs/deployment.md` (secrets, backup, escala).
+- Para entender o fluxo: `docs/architecture.md`.
+- Para PHI / compliance: `docs/security.md`.

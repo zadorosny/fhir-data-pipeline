@@ -1,187 +1,152 @@
 # FHIR Data Pipeline
 
-O projeto implementa:
+[![CI](https://github.com/zadorosny/fhir-data-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/zadorosny/fhir-data-pipeline/actions/workflows/ci.yml)
+[![Security](https://github.com/zadorosny/fhir-data-pipeline/actions/workflows/security.yml/badge.svg)](https://github.com/zadorosny/fhir-data-pipeline/actions/workflows/security.yml)
+
+Pipeline ETL com Kafka + PySpark que carrega pacientes (CSV) em um servidor HAPI FHIR R4, orquestrado por Airflow e empacotado em Docker Compose.
+
 - **Servidor FHIR R4** local (HAPI FHIR) com persistência em PostgreSQL
-- **Pipeline ETL com PySpark e Kafka** para carga dos dados de pacientes no servidor FHIR
-- **Orquestração** com Docker Compose e Airflow
+- **ETL** PySpark → Kafka → consumer Python → POST `/fhir`
+- **Orquestração** com Airflow (DAG re-executável + idempotente)
+- **Observabilidade**: métricas Prometheus + dashboard Grafana opcional
+- **DLQ**: falhas definitivas vão para `fhir-patients-dlq` com diagnóstico em headers
 
----
+## Documentação
 
-## Arquitetura
-
-```
-                              docker-compose
-  ┌──────────────────────────────────────────────────────────────────┐
-  │                                                                  │
-  │  ┌──────────┐    ┌──────────────┐    ┌───────────────────────┐  │
-  │  │PostgreSQL │◄──►│  HAPI FHIR   │    │        Kafka          │  │
-  │  │  :5432    │    │  :8080       │    │  :9092  (UI :9091)    │  │
-  │  └──────────┘    └──────┬───────┘    └───────┬───────────────┘  │
-  │       ▲                 ▲                    │  ▲                │
-  │       │                 │  POST /fhir/*      │  │ publish       │
-  │  ┌────┴─────┐    ┌─────┴──────────┐   ┌─────┴──┴────────┐     │
-  │  │ Airflow  │    │   Consumer     │   │   Producer       │     │
-  │  │  :8081   │    │  (kafka→fhir)  │   │ (csv→kafka)      │     │
-  │  │          │    │                │   │   PySpark         │     │
-  │  └──────────┘    └────────────────┘   └──────────────────┘     │
-  │                                                                  │
-  └──────────────────────────────────────────────────────────────────┘
-```
-
-### Fluxo do pipeline
-
-```
-CSV  →  PySpark (Producer)  →  Kafka (tópico fhir-patients)  →  Consumer  →  HAPI FHIR
-```
-
-1. O **Producer** (PySpark) lê o CSV e publica cada paciente como mensagem JSON no tópico Kafka
-2. O **Consumer** lê as mensagens do Kafka, constrói os Resources FHIR e envia via POST para o HAPI
+| Documento                                | Conteúdo                                                  |
+|------------------------------------------|------------------------------------------------------------|
+| [docs/architecture.md](docs/architecture.md) | Diagrama, fluxo de dados, idempotência                 |
+| [docs/setup.md](docs/setup.md)           | Configuração dos serviços                                  |
+| [docs/deployment.md](docs/deployment.md) | Deploy em produção, backup, escalonamento                  |
+| [docs/security.md](docs/security.md)     | Modelo de ameaças, rotação de segredos, docker.sock        |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Sintomas → causas → fixes                        |
+| [docs/message-schema.json](docs/message-schema.json) | JSON Schema das mensagens Kafka                |
 
 ## Stack
 
-| Serviço    | Imagem                             | Porta | Descrição                               |
-|------------|------------------------------------|-------|-----------------------------------------|
-| PostgreSQL | `postgres:15`                      | 5432  | Banco de dados do HAPI e do Airflow     |
-| HAPI FHIR  | `hapiproject/hapi:latest`          | 8080  | Servidor FHIR R4                        |
-| Kafka      | `apache/kafka:3.8.0`               | 9092  | Broker de mensagens (modo KRaft)        |
-| Kafka UI   | `provectuslabs/kafka-ui:latest`    | 9091  | Interface web para visualização do Kafka|
-| Airflow    | `apache/airflow:2.10.0-python3.12` | 8081  | Orquestrador de workflows               |
-| Producer   | Build local (`etl/Dockerfile`)     | —     | PySpark: CSV → Kafka                    |
-| Consumer   | Build local (`etl/Dockerfile`)     | —     | Kafka → HAPI FHIR                       |
-| hapi-ready | `curlimages/curl:8.10.1`           | —     | Aguarda o HAPI ficar disponível         |
+| Serviço        | Imagem                              | Porta default | Descrição                                |
+|----------------|-------------------------------------|---------------|------------------------------------------|
+| PostgreSQL     | `postgres:15`                       | 5432          | HAPI (schema `public`) + Airflow (schema `airflow`, role dedicada) |
+| HAPI FHIR      | `hapiproject/hapi:latest`           | 8080          | Servidor FHIR R4                         |
+| Kafka (KRaft)  | `apache/kafka:3.8.0`                | 9092          | Tópicos: `fhir-patients` + `fhir-patients-dlq` |
+| Kafka UI       | `provectuslabs/kafka-ui`            | 9091          | Inspeção visual de tópicos               |
+| Airflow        | `apache/airflow:2.10.0-python3.12`  | 8081          | DAG `fhir_patient_etl`                   |
+| Producer       | build local (`etl/`)                | —             | PySpark CSV → Kafka                      |
+| Consumer       | build local (`etl/`)                | 8001 metrics  | Kafka → HAPI com retries + DLQ           |
+| Prometheus*    | `prom/prometheus`                   | 9090          | Scrape do consumer (opcional)            |
+| Grafana*       | `grafana/grafana`                   | 3000          | Dashboard provisionado (opcional)        |
 
-## Pré-requisitos
+`*` requer `--profile monitoring` + `docker-compose.observability.yml`.
 
-- [Docker](https://docs.docker.com/get-docker/) e [Docker Compose](https://docs.docker.com/compose/install/) instalados
-- Portas **5432**, **8080**, **8081**, **9091** e **9092** disponíveis
-
-## Como executar
+## Quickstart
 
 ```bash
-# 1. Clonar o repositório
 git clone https://github.com/zadorosny/fhir-data-pipeline.git
 cd fhir-data-pipeline
 
-# 2. Subir todos os serviços (build + start)
-docker-compose up -d --build
+# 1. Configurar segredos (NUNCA commitar .env)
+cp .env.example .env
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+openssl rand -hex 32
+# Edite .env e substitua os 'change-me-*' (incluindo as duas chaves geradas acima).
 
-# 3. Acompanhar o Producer (CSV → Kafka)
-docker logs -f fhir_producer
+# 2. Subir o stack
+docker compose --env-file .env up -d --build
 
-# 4. Acompanhar o Consumer (Kafka → HAPI FHIR)
-docker logs -f fhir_consumer
+# 3. Verificar
+curl -fsS http://localhost:8080/fhir/Patient?_summary=count   # total de Patients
+curl -fsS http://localhost:8001/metrics | grep fhir_consumer  # métricas do consumer
 ```
 
-O container `hapi-ready` faz polling até o HAPI responder em `/fhir/metadata`. Só então o Producer inicia, publica as 50 mensagens no Kafka, e em seguida o Consumer consome e carrega no HAPI FHIR.
+⚠️ **As credenciais de `.env.example` são placeholders explícitos (`change-me-*`)**. O compose **falha intencionalmente** se você não trocar — todas as variáveis sensíveis usam a sintaxe `${VAR:?msg}`.
 
-## Verificando o pipeline
+## Como funciona
 
-### Kafka UI
-
-Acesse http://localhost:9091 para ver o tópico `fhir-patients` com as 50 mensagens publicadas pelo Producer.
-
-### HAPI FHIR
-
-```bash
-# Total de pacientes (deve ser 50)
-curl http://localhost:8080/fhir/Patient?_summary=count
-
-# Total de condições clínicas (deve ser 15)
-curl http://localhost:8080/fhir/Condition?_summary=count
-
-# Buscar paciente por CPF
-curl "http://localhost:8080/fhir/Patient?identifier=12345678900"
-
-# Listar condições clínicas
-curl http://localhost:8080/fhir/Condition
+```
+CSV  →  PySpark (producer)  →  Kafka 'fhir-patients'  →  Consumer  →  POST /fhir/Patient + /fhir/Condition
+                                                              │
+                                                              └─ falha definitiva → Kafka 'fhir-patients-dlq'
 ```
 
-### Logs dos containers
+1. **Producer** lê `data/patients.csv` (ISO-8859-1), normaliza cabeçalhos com acentos/BOM e publica uma mensagem JSON por linha. Aborta se faltar coluna (`ColumnMappingError`).
+2. **Consumer** usa `If-None-Exist` para conditional create — re-executar o DAG não duplica recursos.
+3. Falhas transientes (429/5xx/conn) reentregam até 5×; falhas definitivas vão para a DLQ com `reason`, `status_code`, `body_preview` nos headers.
 
-```bash
-# Producer: deve mostrar "Publicadas 50 mensagens no tópico 'fhir-patients'"
-docker logs fhir_producer
+## Idempotência (detalhes)
 
-# Consumer: deve mostrar "Pacientes criados: 50 / Condições criadas: 15 / Erros: 0"
-docker logs fhir_consumer
-```
+| Resource    | Critério de busca                                                |
+|-------------|------------------------------------------------------------------|
+| `Patient`   | `identifier=http://rnds-fhir.saude.gov.br/fhir/r4/NamingSystem/cpf\|<cpf>` |
+| `Condition` | `subject=Patient/<id>&code=http://snomed.info/sct\|<snomed_code>` |
+
+- HTTP 201 → criado; HTTP 200 → já existia. O consumer trata os dois casos.
+- O CSV é considerado dataset-fonte estável: re-rodar o DAG sobre o mesmo CSV produz o mesmo conjunto de recursos.
 
 ## Mapeamento FHIR
 
-### CSV → Resource Patient (perfil BRIndivíduo)
+### CSV → `Patient` (perfil BRIndivíduo)
 
-| Coluna CSV           | Campo FHIR                     | Observação                                 |
-|----------------------|--------------------------------|--------------------------------------------|
-| Nome                 | `Patient.name`                 | Último sobrenome como `family`, demais como `given` |
-| CPF                  | `Patient.identifier`           | System: `NamingSystem/cpf` da RNDS         |
-| Gênero               | `Patient.gender`               | Masculino → `male`, Feminino → `female`    |
-| Data de Nascimento   | `Patient.birthDate`            | Convertido de DD/MM/AAAA para AAAA-MM-DD   |
-| Telefone             | `Patient.telecom`              | `system: phone`, `use: mobile`             |
-| País de Nascimento   | `Patient.extension`            | Extensão `patient-birthPlace`              |
+| Coluna CSV           | Campo FHIR             | Observação                                       |
+|----------------------|------------------------|--------------------------------------------------|
+| Nome                 | `Patient.name`         | Última palavra como `family`, demais como `given`|
+| CPF                  | `Patient.identifier`   | `NamingSystem/cpf` da RNDS                       |
+| Gênero               | `Patient.gender`       | Masculino → `male`, Feminino → `female`, Outro → `other` |
+| Data de Nascimento   | `Patient.birthDate`    | `DD/MM/AAAA` → `AAAA-MM-DD`                      |
+| Telefone             | `Patient.telecom`      | `system=phone, use=mobile` (omitido se vazio)    |
+| País de Nascimento   | `Patient.extension`    | `patient-birthPlace` (omitido se vazio)          |
 
-### Coluna Observação → Resource Condition
+### Observação → `Condition`
 
-| Valor          | SNOMED CT  | ICD-10 | Descrição                        |
-|----------------|-----------|--------|----------------------------------|
-| Gestante       | 77386006  | Z33    | Pregnant (finding)               |
-| Diabético      | 73211009  | E14    | Diabetes mellitus (disorder)     |
-| Hipertenso     | 38341003  | I10    | Hypertensive disorder (disorder) |
+| Token        | SNOMED CT  | ICD-10 | Descrição                       |
+|--------------|------------|--------|---------------------------------|
+| Gestante     | 77386006   | Z33    | Pregnant (finding)              |
+| Diabético    | 73211009   | E14    | Diabetes mellitus (disorder)    |
+| Hipertenso   | 38341003   | I10    | Hypertensive disorder           |
 
-Valores compostos (ex: `Diabético|Hipertenso`) geram múltiplos Resources `Condition` vinculados ao mesmo `Patient`.
+Valores compostos (`Diabético|Hipertenso`) geram múltiplos `Condition` ligados ao mesmo `Patient`.
 
-## Perfil BRIndivíduo (Bônus)
+## Desenvolvimento
 
-O pipeline utiliza o perfil **BRIndivíduo** da RNDS (Rede Nacional de Dados em Saúde):
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+pre-commit install
 
-- **Profile**: `http://www.saude.gov.br/fhir/r4/StructureDefinition/BRIndividuo-1.0`
-- **CPF System**: `http://rnds-fhir.saude.gov.br/fhir/r4/NamingSystem/cpf`
-- **Referência**: https://simplifier.net/redenacionaldedadosemsaude/brindividuo
+pytest -m "not integration"                     # unit tests (87% coverage em etl/lib)
+ruff check . && black --check . && mypy etl/lib # lint + types
+
+pytest -m integration                           # sobe compose e valida HAPI (~5min)
+```
 
 ## Airflow
 
-Acesse o painel em http://localhost:8081 com as credenciais:
+- UI: http://localhost:8081 (`$AIRFLOW_ADMIN_USER` / `$AIRFLOW_ADMIN_PASSWORD`).
+- DAG `fhir_patient_etl`: dispara `kafka_producer` → `kafka_consumer` (re-executável).
+- Falhas chamam `alert_on_failure` que POSTa para `ALERT_WEBHOOK_URL` (Slack/Teams), se configurado.
 
-- **Usuário**: `admin`
-- **Senha**: `admin`
-
-A DAG `fhir_patient_etl` é disparada manualmente via UI ou CLI (`airflow dags trigger fhir_patient_etl`). O pipeline inicial roda automaticamente via Docker Compose; o Airflow permite **re-execuções sob demanda**. O Consumer é **idempotente**: verifica se o paciente (por CPF) e as condições já existem antes de criar, evitando duplicatas.
-
-Tasks em sequência:
-1. `kafka_producer` — executa o Producer (CSV → Kafka)
-2. `kafka_consumer` — executa o Consumer (Kafka → HAPI FHIR)
-
-## Estrutura do repositório
+## Estrutura
 
 ```
 .
-├── airflow/
-│   └── dags/
-│       └── fhir_etl_dag.py            # DAG do Airflow (producer → consumer)
-├── data/
-│   └── patients.csv                    # Dados de entrada (50 pacientes)
-├── docs/
-│   └── setup.md                        # Documentação detalhada da solução
+├── airflow/dags/fhir_etl_dag.py        # DAG re-executável + on_failure_callback
+├── data/patients.csv                    # 50 pacientes de exemplo (ISO-8859-1)
+├── docs/                                # Arquitetura, deploy, segurança, troubleshooting
 ├── etl/
-│   ├── Dockerfile                      # Imagem Python + PySpark + JRE + kafka-python
-│   ├── kafka_producer.py               # PySpark: CSV → Kafka
-│   └── kafka_consumer.py               # Kafka → HAPI FHIR
-├── hapi/
-│   └── application.yaml                # Configuração do HAPI FHIR
-├── postgres/
-│   └── init-airflow.sql                # Script de inicialização do banco
-├── docker-compose.yml                  # Orquestração de todos os serviços
-├── .gitignore
-└── README.md
+│   ├── Dockerfile                       # Python 3.12 slim + JRE + requirements pinados
+│   ├── requirements.txt                 # pyspark, kafka-python-ng, requests, prometheus-client...
+│   ├── kafka_producer.py                # CSV → Kafka (acks=all, retries=5)
+│   ├── kafka_consumer.py                # Kafka → HAPI com retries e DLQ; expõe /metrics
+│   └── lib/                             # config, transform, fhir, dlq, metrics, logging
+├── hapi/application.yaml                # Configuração do HAPI (env placeholders)
+├── observability/                       # Prometheus + dashboards Grafana
+├── postgres/init-db.sh                  # Cria schema airflow + role airflow_user (menor privilégio)
+├── tests/                               # 67 testes unit + 3 integration
+├── docker-compose.yml                   # Stack core
+├── docker-compose.observability.yml     # Prometheus + Grafana (profile monitoring)
+├── pyproject.toml                       # ruff/black/mypy/pytest config
+├── requirements-dev.txt                 # Lint + test + types
+├── .env.example                         # Template de segredos (NÃO commitar .env)
+├── .github/workflows/{ci,security}.yml  # GitHub Actions
+├── .github/dependabot.yml               # Updates semanais
+└── .pre-commit-config.yaml              # ruff, black, mypy, detect-secrets
 ```
-
-## Decisões técnicas
-
-1. **HAPI FHIR** — Implementação open-source mais madura para servidores FHIR R4.
-2. **PostgreSQL 15** — Persistência robusta; compartilhado entre HAPI e Airflow com schemas separados.
-3. **PySpark** — Leitura e transformação do CSV com processamento distribuído.
-4. **Kafka** — Desacopla a produção (leitura do CSV) do consumo (carga no FHIR), permitindo reprocessamento e escalabilidade.
-5. **Kafka UI** — Interface web para visualização de tópicos e mensagens.
-6. **Condition para observações** — Resource FHIR adequado para diagnósticos e condições clínicas.
-7. **Codificação dupla (SNOMED CT + ICD-10)** — Cada Condition inclui ambos os sistemas de codificação, garantindo interoperabilidade.
-8. **Idempotência no Consumer** — Antes de criar Patient ou Condition, o Consumer verifica se o recurso já existe, permitindo re-execuções seguras via Airflow.
-9. **hapi-ready sidecar** — Container auxiliar com `curl --retry` que garante que o pipeline só inicia quando o HAPI está de fato respondendo.

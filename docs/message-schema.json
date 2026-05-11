@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/zadorosny/fhir-data-pipeline/docs/message-schema.json",
+  "title": "FHIR Patient Message",
+  "description": "Mensagem JSON publicada pelo etl-producer no tópico Kafka 'fhir-patients'. Cada mensagem representa uma linha do CSV após normalização de cabeçalhos.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "nome",
+    "cpf",
+    "genero",
+    "data_nascimento",
+    "telefone",
+    "pais",
+    "observacao"
+  ],
+  "properties": {
+    "nome": {
+      "type": "string",
+      "description": "Nome completo. Última palavra vira Patient.name.family; demais viram given.",
+      "examples": ["João da Silva", "Maria Souza"]
+    },
+    "cpf": {
+      "type": "string",
+      "description": "CPF (com ou sem máscara). É normalizado para apenas dígitos via clean_cpf antes do envio ao HAPI.",
+      "examples": ["123.456.789-00", "12345678900"]
+    },
+    "genero": {
+      "type": "string",
+      "description": "Termo PT-BR. Mapeado para administrative-gender (male|female|other|unknown).",
+      "examples": ["Masculino", "Feminino", "Outro"]
+    },
+    "data_nascimento": {
+      "type": "string",
+      "description": "Data em DD/MM/AAAA. Aceita também ISO (YYYY-MM-DD) e DD-MM-AAAA. Inválido → 1900-01-01.",
+      "examples": ["10/05/1980"]
+    },
+    "telefone": {
+      "type": "string",
+      "description": "Texto livre. Vai para Patient.telecom[system=phone, use=mobile]. Pode ser vazio.",
+      "examples": ["(11) 1234-5678", ""]
+    },
+    "pais": {
+      "type": "string",
+      "description": "País de nascimento. Vai para extensão patient-birthPlace.valueAddress.country. Pode ser vazio.",
+      "examples": ["Brasil", ""]
+    },
+    "observacao": {
+      "type": "string",
+      "description": "Lista de observações separadas por '|'. Cada token conhecido (Gestante, Diabético, Hipertenso) gera um Resource Condition com SNOMED CT + ICD-10.",
+      "examples": ["", "Gestante", "Diabético|Hipertenso"]
+    }
+  },
+  "examples": [
+    {
+      "nome": "Maria Souza",
+      "cpf": "987.654.321-01",
+      "genero": "Feminino",
+      "data_nascimento": "15/08/1992",
+      "telefone": "(21) 9876-5432",
+      "pais": "Brasil",
+      "observacao": "Gestante"
+    }
+  ]
+}
