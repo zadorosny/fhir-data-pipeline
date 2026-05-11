@@ -8,6 +8,15 @@ x-postgres-creds: &postgres-creds
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD nao definido em .env}
   POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB nao definido em .env}
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-default-restart: &default-restart
+  restart: unless-stopped
+
 services:
 
   postgres:
@@ -27,6 +36,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    logging: *default-logging
+    restart: unless-stopped
 
   hapi-fhir:
     image: hapiproject/hapi:latest
@@ -44,19 +55,24 @@ services:
       - ./hapi/application.yaml:/app/config/application.yaml:ro
     ports:
       - "${HAPI_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/fhir/metadata"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    logging: *default-logging
+    restart: unless-stopped
 
   hapi-ready:
     image: curlimages/curl:8.10.1
     container_name: fhir_hapi_ready
     depends_on:
-      - hapi-fhir
-    command:
-      [
-        "curl","--fail","--silent","--show-error",
-        "--retry","90","--retry-delay","2","--retry-connrefused",
-        "http://hapi-fhir:8080/fhir/metadata"
-      ]
+      hapi-fhir:
+        condition: service_healthy
+    command: ["true"]
     restart: "no"
+    logging: *default-logging
 
   kafka:
     image: apache/kafka:3.8.0
@@ -81,6 +97,8 @@ services:
       timeout: 5s
       retries: 15
       start_period: 15s
+    logging: *default-logging
+    restart: unless-stopped
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -92,6 +110,7 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
     ports:
       - "${KAFKA_UI_PORT:-9091}:8080"
+    logging: *default-logging
     restart: unless-stopped
 
   airflow:
@@ -130,6 +149,14 @@ services:
           --password "$${AIRFLOW_ADMIN_PASSWORD}" || true
         airflow webserver &
         exec airflow scheduler
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging: *default-logging
+    restart: unless-stopped
 
   etl-producer:
     build: ./etl
@@ -148,8 +175,9 @@ services:
         condition: service_completed_successfully
       kafka:
         condition: service_healthy
-    restart: "no"
+    restart: on-failure:3
     command: ["python", "-m", "etl.kafka_producer"]
+    logging: *default-logging
 
   etl-consumer:
     build: ./etl
@@ -169,8 +197,17 @@ services:
     depends_on:
       etl-producer:
         condition: service_completed_successfully
-    restart: "no"
+    ports:
+      - "${METRICS_PORT:-8001}:8001"
+    restart: on-failure:3
     command: ["python", "-m", "etl.kafka_consumer"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/metrics',timeout=2).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
 
 volumes:
   pgdata:
