@@ -19,6 +19,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S105", "S106", "S311"]
+"tests/integration/**" = ["S105", "S106", "S311", "S603", "S607"]
 "etl/kafka_consumer.py" = ["S113"]
 "etl/kafka_producer.py" = ["S113"]
 
