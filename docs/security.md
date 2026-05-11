@@ -37,7 +37,7 @@ O `hapi-fhir` no compose escuta HTTP simples em `8080`. Para produção:
 
 1. Coloque um reverse proxy (Caddy, Nginx, Traefik) na frente com cert via Let's Encrypt.
 2. Habilite autenticação (Smart-on-FHIR ou Basic + IP allowlist).
-3. Validação de payloads (`hapi.fhir.validation.requests_enabled` e `responses_enabled`) já está **habilitada** em `hapi/application.yaml` — recusa POSTs malformados com HTTP 422, que o consumer roteia para a DLQ.
+3. Validação de payloads (`hapi.fhir.validation.requests_enabled`) está **temporariamente desligada** em `hapi/application.yaml`. Para reabilitar: carregar o StructureDefinition do perfil `BRIndividuo-1.0` no HAPI (via NpmPackage do RNDS ou IG do MS) — sem o perfil carregado, HAPI rejeita 100% dos POSTs com `VALIDATION_VAL_PROFILE_UNKNOWN_NOT_POLICY`. Tracked como follow-up.
 
 ## Logs e PHI
 
