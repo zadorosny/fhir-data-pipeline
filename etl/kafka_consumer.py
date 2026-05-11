@@ -143,6 +143,12 @@ def main() -> int:
         delay=settings.hapi_retry_delay,
     )
 
+    # Sem group_id: consumer assina o topico sem coordenacao de grupo.
+    # Offsets NAO sao persistidos - no restart re-lemos desde o inicio. Seguro
+    # porque o pipeline e idempotente via FHIR `If-None-Exist` (patient_search_
+    # criteria, condition_search_criteria). Tentativa anterior com group_id +
+    # consumer.commit() expos incompatibilidade entre kafka-python-ng e KRaft
+    # (JoinGroup nunca completa). Tracked como follow-up.
     consumer = KafkaConsumer(
         settings.kafka_topic,
         bootstrap_servers=settings.kafka_broker,
@@ -171,7 +177,6 @@ def main() -> int:
                 )
                 dlq_total.inc()
                 totals["patient_dlq"] += 1
-                consumer.commit()
                 continue
 
             totals["patient_ok"] += 1
@@ -180,7 +185,6 @@ def main() -> int:
                 session, settings.fhir_base, patient_ref, observations, logger
             )
             totals["condition_err"] += cond_errors
-            consumer.commit()
     finally:
         consumer.close()
         dlq_producer.close(timeout=5)
