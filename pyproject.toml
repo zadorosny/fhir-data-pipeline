@@ -1,0 +1,57 @@
+[project]
+name = "fhir-data-pipeline"
+version = "0.2.0"
+description = "ETL CSV -> Kafka -> HAPI FHIR com PySpark, Airflow e Docker"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["airflow/dags", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM", "C4", "RET"]
+ignore = [
+    "S101",  # asserts em testes
+    "S311",  # random nao-criptografico em fixtures
+    "E501",  # gerenciado pelo ruff format
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S311"]
+"tests/integration/**" = ["S105", "S106", "S311", "S603", "S607"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+files = ["etl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "integration: testes que sobem docker-compose (lentos)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["etl/lib"]
+omit = ["tests/*"]
+branch = true
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
+skip_covered = false
+fail_under = 80
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
