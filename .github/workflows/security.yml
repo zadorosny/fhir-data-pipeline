@@ -11,7 +11,6 @@ on:
 permissions:
   contents: read
   security-events: write
-  pull-requests: read # gitleaks lista os commits do PR em eventos pull_request
 
 jobs:
 
@@ -65,6 +64,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: gitleaks/gitleaks-action@83373cf2f8c4db6e24b41c1a9b086bb9619e9cd3 # v2.3.7
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # CLI direto em vez da gitleaks-action: a action monta o range "<raiz>^..HEAD"
+      # e quebra quando o push contém o commit raiz; escanear o histórico completo evita isso
+      - name: Run gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar xz gitleaks
+          ./gitleaks detect --source . --redact -v
