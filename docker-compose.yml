@@ -1,0 +1,228 @@
+name: fhir-pipeline
+
+# Variaveis carregadas de .env (use .env.example como template).
+# Nenhuma credencial deve viver hardcoded neste arquivo.
+
+x-postgres-creds: &postgres-creds
+  POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER nao definido em .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD nao definido em .env}
+  POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB nao definido em .env}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-default-restart: &default-restart
+  restart: unless-stopped
+
+services:
+
+  postgres:
+    image: postgres:15
+    container_name: fhir_postgres
+    environment:
+      <<: *postgres-creds
+      AIRFLOW_DB_USER: ${AIRFLOW_DB_USER:?AIRFLOW_DB_USER nao definido em .env}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?AIRFLOW_DB_PASSWORD nao definido em .env}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init-db.sh:/docker-entrypoint-initdb.d/10-init-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+    restart: unless-stopped
+
+  hapi-fhir:
+    image: hapiproject/hapi:latest
+    container_name: hapi_fhir
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+      spring.jpa.properties.hibernate.dialect: org.hibernate.dialect.PostgreSQLDialect
+      hapi.fhir.allow_cascading_deletes: "true"
+    volumes:
+      - ./hapi/application.yaml:/app/config/application.yaml:ro
+    ports:
+      - "${HAPI_PORT:-8080}:8080"
+    # Imagem distroless (USER 65532) sem shell/curl/wget - sonda HTTP precisa
+    # vir de fora. Readiness e garantida pelo sidecar `hapi-ready` abaixo.
+    logging: *default-logging
+    restart: unless-stopped
+
+  # Sidecar de readiness: aguarda HAPI responder ao /fhir/metadata. Servicos
+  # downstream (producer, consumer) usam `depends_on: condition:
+  # service_completed_successfully` para serializar o startup.
+  hapi-ready:
+    image: curlimages/curl:8.10.1
+    container_name: fhir_hapi_ready
+    depends_on:
+      - hapi-fhir
+    command:
+      - sh
+      - -c
+      - |
+        for i in $$(seq 1 60); do
+          if curl -sf http://hapi-fhir:8080/fhir/metadata > /dev/null; then
+            echo "HAPI ready after $$i attempt(s)"; exit 0
+          fi
+          sleep 5
+        done
+        echo "HAPI did not become ready in 5 minutes"; exit 1
+    restart: "no"
+    logging: *default-logging
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: fhir_kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Precisa apontar para o volume kafka_data (abaixo) — em /tmp os dados
+      # (incluindo a DLQ) evaporam a cada recreate do container. O diretorio
+      # ja existe na imagem com dono appuser, entao o volume herda a permissao.
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+    logging: *default-logging
+    restart: unless-stopped
+
+  # UI administrativa do Kafka. Sem autenticacao - opt-in via:
+  #   docker compose --profile debug up -d
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka_ui
+    profiles: ["debug"]
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "${KAFKA_UI_PORT:-9091}:8080"
+    logging: *default-logging
+    restart: unless-stopped
+
+  airflow:
+    image: apache/airflow:2.10.0-python3.12
+    container_name: airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:?AIRFLOW__CORE__FERNET_KEY nao definido em .env}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:?AIRFLOW__WEBSERVER__SECRET_KEY nao definido em .env}
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "False"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:?AIRFLOW_ADMIN_USER nao definido em .env}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?AIRFLOW_ADMIN_PASSWORD nao definido em .env}
+      AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@example.com}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${AIRFLOW_PORT:-8081}:8080"
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db init
+        airflow users create \
+          --username "$${AIRFLOW_ADMIN_USER}" \
+          --firstname Admin --lastname User --role Admin \
+          --email "$${AIRFLOW_ADMIN_EMAIL}" \
+          --password "$${AIRFLOW_ADMIN_PASSWORD}" || true
+        airflow webserver &
+        exec airflow scheduler
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging: *default-logging
+    restart: unless-stopped
+
+  etl-producer:
+    build: ./etl
+    container_name: fhir_producer
+    environment:
+      KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-fhir-patients}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-fhir-patients-dlq}
+      CSV_PATH: ${CSV_PATH:-/opt/app/data/patients.csv}
+      CSV_ENCODING: ${CSV_ENCODING:-ISO-8859-1}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/opt/app/data
+    depends_on:
+      hapi-ready:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+    restart: on-failure:3
+    command: ["python", "-m", "etl.kafka_producer"]
+    logging: *default-logging
+
+  etl-consumer:
+    build: ./etl
+    container_name: fhir_consumer
+    environment:
+      KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-fhir-patients}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-fhir-patients-dlq}
+      HAPI_BASE_URL: ${HAPI_BASE_URL:-http://hapi-fhir:8080/fhir}
+      CONSUMER_TIMEOUT_MS: ${CONSUMER_TIMEOUT_MS:-15000}
+      HAPI_RETRY_ATTEMPTS: ${HAPI_RETRY_ATTEMPTS:-30}
+      HAPI_RETRY_DELAY: ${HAPI_RETRY_DELAY:-2}
+      FHIR_POST_MAX_RETRIES: ${FHIR_POST_MAX_RETRIES:-5}
+      FHIR_POST_BACKOFF: ${FHIR_POST_BACKOFF:-0.5}
+      METRICS_PORT: ${METRICS_PORT:-8001}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      etl-producer:
+        condition: service_completed_successfully
+    ports:
+      - "${METRICS_PORT:-8001}:8001"
+    restart: on-failure:3
+    command: ["python", "-m", "etl.kafka_consumer"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/metrics',timeout=2).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+
+volumes:
+  pgdata:
+  kafka_data:
