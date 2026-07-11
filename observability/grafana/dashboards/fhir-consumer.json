@@ -1,0 +1,67 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Patients created",
+      "targets": [
+        {"expr": "sum(fhir_consumer_messages_total{resource=\"Patient\",status=\"created\"})"}
+      ],
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0}
+    },
+    {
+      "type": "stat",
+      "title": "Patients existing (skip)",
+      "targets": [
+        {"expr": "sum(fhir_consumer_messages_total{resource=\"Patient\",status=\"exists\"})"}
+      ],
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 0}
+    },
+    {
+      "type": "stat",
+      "title": "Conditions created",
+      "targets": [
+        {"expr": "sum(fhir_consumer_messages_total{resource=\"Condition\",status=\"created\"})"}
+      ],
+      "gridPos": {"h": 5, "w": 6, "x": 12, "y": 0}
+    },
+    {
+      "type": "stat",
+      "title": "DLQ total",
+      "targets": [
+        {"expr": "sum(fhir_consumer_dlq_total)"}
+      ],
+      "gridPos": {"h": 5, "w": 6, "x": 18, "y": 0}
+    },
+    {
+      "type": "timeseries",
+      "title": "POST latency (p95) by resource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(fhir_consumer_post_latency_seconds_bucket[5m])) by (le, resource))",
+          "legendFormat": "{{resource}}"
+        }
+      ],
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 5}
+    },
+    {
+      "type": "timeseries",
+      "title": "Throughput by status",
+      "targets": [
+        {
+          "expr": "sum(rate(fhir_consumer_messages_total[1m])) by (resource, status)",
+          "legendFormat": "{{resource}} / {{status}}"
+        }
+      ],
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 14}
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["fhir"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "title": "FHIR Consumer",
+  "uid": "fhir-consumer",
+  "version": 1
+}
